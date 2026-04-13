@@ -14,6 +14,7 @@ class CacheContext:
         default_factory=lambda: defaultdict(int))
     sequence_num: int = 0
     use_cache: bool = False
+    last_diff_value: float = 0.0
 
     def get_incremental_name(self, name=None):
         if name is None:
@@ -115,10 +116,30 @@ def are_two_tensors_similar(t1, t2, *, threshold, only_shape=False):
         return False
     elif only_shape:
         return True
-    mean_diff = (t1 - t2).abs().mean()
-    mean_t1 = t1.abs().mean()
+
+    numel = t1.numel()
+    if numel > 65536:
+        # Sample for efficiency on large tensors (e.g. Anima [B,T,H,W,D] = ~8M elements)
+        # 8192 samples gives statistically reliable estimate with ~8x less memory/compute
+        flat1 = t1.reshape(-1)
+        flat2 = t2.reshape(-1)
+        stride = numel // 8192
+        s1 = flat1[::stride]
+        s2 = flat2[::stride]
+        mean_diff = (s1 - s2).abs().mean()
+        mean_t1 = s1.abs().mean()
+    else:
+        mean_diff = (t1 - t2).abs().mean()
+        mean_t1 = t1.abs().mean()
+
     diff = mean_diff / mean_t1
-    return diff.item() < threshold
+    diff_value = diff.item()
+
+    cache_context = get_current_cache_context()
+    if cache_context is not None:
+        cache_context.last_diff_value = diff_value
+
+    return diff_value < threshold
 
 
 @torch.compiler.disable()
@@ -844,3 +865,81 @@ def create_patch_flux_forward_orig(model,
             yield
 
     return patch_forward_orig
+
+
+class CachedAnimaBlocks(torch.nn.Module):
+    """
+    Cached wrapper for Anima (MiniTrainDIT) blocks.
+
+    Anima blocks have signature: block(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs)
+    and return a single tensor (not a tuple). crossattn_emb does not change between blocks.
+    This wrapper replaces self.blocks with a single-element ModuleList containing this module,
+    so the original _forward's `for block in self.blocks` loop calls this once.
+
+    num_always_run: number of blocks to always execute (default 1 = only block[0]).
+    On cache hit, blocks[num_always_run:] are skipped and their cached residual is applied.
+    On cache miss, all blocks run and the residual for blocks[num_always_run:] is saved.
+    """
+
+    def __init__(
+        self,
+        blocks,
+        *,
+        residual_diff_threshold,
+        validate_can_use_cache_function=None,
+        num_always_run=1,
+    ):
+        super().__init__()
+        self.blocks = blocks
+        self.residual_diff_threshold = residual_diff_threshold
+        self.validate_can_use_cache_function = validate_can_use_cache_function
+        self.num_always_run = max(1, min(num_always_run, len(blocks)))
+
+    def forward(self, hidden_states, *args, **kwargs):
+        if self.residual_diff_threshold <= 0.0:
+            for block in self.blocks:
+                hidden_states = block(hidden_states, *args, **kwargs)
+            return hidden_states
+
+        original_hidden_states = hidden_states
+
+        # Run block[0] as cache indicator
+        hidden_states = self.blocks[0](hidden_states, *args, **kwargs)
+
+        # Compute first block residual for cache decision
+        first_hidden_states_residual = hidden_states - original_hidden_states
+        del original_hidden_states
+
+        # Decide whether to use cache
+        can_use_cache = get_can_use_cache(
+            first_hidden_states_residual,
+            threshold=self.residual_diff_threshold,
+            validation_function=self.validate_can_use_cache_function,
+        )
+        if not can_use_cache:
+            set_buffer("first_hidden_states_residual",
+                       first_hidden_states_residual)
+        del first_hidden_states_residual
+
+        torch._dynamo.graph_break()
+
+        # Always run blocks[1:num_always_run] (both hit and miss paths)
+        for block in self.blocks[1:self.num_always_run]:
+            hidden_states = block(hidden_states, *args, **kwargs)
+
+        if can_use_cache:
+            # Cache hit: apply cached residual for blocks[num_always_run:]
+            hidden_states = apply_prev_hidden_states_residual(hidden_states)
+        else:
+            # Cache miss: run blocks[num_always_run:] and save residual
+            original_after_always_run = hidden_states
+            for block in self.blocks[self.num_always_run:]:
+                hidden_states = block(hidden_states, *args, **kwargs)
+
+            if not hidden_states.is_contiguous():
+                hidden_states = hidden_states.contiguous()
+            hidden_states_residual = hidden_states - original_after_always_run
+            set_buffer("hidden_states_residual", hidden_states_residual)
+
+        torch._dynamo.graph_break()
+        return hidden_states

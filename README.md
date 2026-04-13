@@ -47,6 +47,7 @@ You can find demo workflows in the `workflows` folder.
 | HunyuanVideo with First Block Cache | [workflows/hunyuan_video.json](./workflows/hunyuan_video.json)
 | SD3.5 with First Block Cache and Compilation | [workflows/sd3.5.json](./workflows/sd3.5.json)
 | SDXL with First Block Cache | [workflows/sdxl.json](./workflows/sdxl.json)
+| Anima with First Block Cache | [workflows/anima.json](./workflows/anima.json)
 
 **NOTE**: The `Compile Model+` node requires your computation to meet some software and hardware requirements, please refer to the [Enhanced `torch.compile`](#enhanced-torchcompile) section for more information.
 If you have problems with the compilation node, you can remove it from the workflow and only use the `Apply First Block Cache` node.
@@ -61,7 +62,7 @@ This can significantly reduce the computation cost of the model, achieving a spe
 To use first block cache, simply add the `wavespeed->Apply First Block Cache` node to your workflow after your `Load Diffusion Model` node and adjust the `residual_diff_threashold` value to a suitable value for your model, for example: `0.12` for `flux-dev.safetensors` with `fp8_e4m3fn_fast` and 28 steps.
 It is expected to see a speedup of 1.5x to 3.0x with acceptable accuracy loss.
 
-It supports many models like `FLUX`, `LTXV (native and non-native)`, `HunyuanVideo (native)`, `SD3.5` and `SDXL`, feel free to try it out and let us know if you have any issues!
+It supports many models like `FLUX`, `LTXV (native and non-native)`, `HunyuanVideo (native)`, `SD3.5`, `SDXL` and `Anima`, feel free to try it out and let us know if you have any issues!
 
 Some configurations for different models that you can try:
 
@@ -72,8 +73,32 @@ Some configurations for different models that you can try:
 | `hunyuan_video_720_cfgdistill_fp8_e4m3fn.safetensors` | 20 | 0.1 |
 | `sd3.5_large_fp8_scaled.safetensors` | 30 | 0.12 |
 | `sd_xl_base_1.0.safetensors` | 25 | 0.2 |
+| `animaOfficial_preview3Base.safetensors` | 30 | 0.08 |
 
 **NOTE**: SDXL First Block Cache is incompatible with the [FreeU Advanced](https://github.com/WASasquatch/FreeU_Advanced) node pack and will not function properly if it is installed and enabled.
+
+### Anima
+
+Anima is a DiT-based image generation model that uses a Qwen3-06B text encoder and a T5-XXL adapter. It is natively supported by ComfyUI and uses the standard `Load Diffusion Model` + `KSampler` workflow (identical to SDXL).
+
+To accelerate Anima with First Block Cache:
+
+1. Load your Anima model with the `Load Diffusion Model` node (type: `stable_diffusion`).
+2. Add the `wavespeed->Apply First Block Cache` node between the model loader and the KSampler.
+3. Connect the model output to the FBCache node, then connect the FBCache output to the KSampler.
+4. Set `residual_diff_threshold` to `0.08` as a starting point.
+
+**Tuning tips**:
+
+- Anima uses 28 transformer blocks internally. FBCache skips blocks 1-27 on cache hits, only running block 0.
+- Start with `residual_diff_threshold = 0.05` for highest quality, increase to `0.08`-`0.12` for more speed.
+- Use `max_consecutive_cache_hits = 1` if you notice quality degradation at higher thresholds.
+- Anima supports `bfloat16` and `float32` inference (fp16 is not supported).
+
+```
+[Load Diffusion Model] -> [Apply First Block Cache] -> [KSampler]
+      (Anima)            (threshold: 0.08)
+```
 
 See [Apply First Block Cache on FLUX.1-dev](https://github.com/chengzeyi/ParaAttention/blob/main/doc/fastest_flux.md#apply-first-block-cache-on-flux1-dev) for more information and detailed comparison on quality and speed.
 
